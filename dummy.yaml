@@ -1,0 +1,365 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ku-junyoung-dummy-job-test-etcd
+  namespace: p-ncai-wbl
+  labels: { app: ku-junyoung-dummy-job-test-etcd }
+spec:
+  selector: { app: ku-junyoung-dummy-job-test-etcd }
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ku-junyoung-dummy-job-test-etcd
+  namespace: p-ncai-wbl
+  labels: { app: ku-junyoung-dummy-job-test-etcd }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ku-junyoung-dummy-job-test-etcd }
+  template:
+    metadata:
+      labels: { app: ku-junyoung-dummy-job-test-etcd }
+      annotations:
+        sidecar.istio.io/inject: "false"   # 사이드카 강제 비활성(중요)
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: h100-i001v8
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.13
+          command: ["/usr/local/bin/etcd"]
+          args:
+            - --data-dir=/var/lib/etcd
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://ku-junyoung-dummy-job-test-etcd.p-ncai-wbl.svc.cluster.local:2379
+            - --enable-v2=true                # v2 API 활성(중요)
+          ports:
+            - { name: client, containerPort: 2379 }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet: { path: /health, port: 2379, scheme: HTTP }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 2379, scheme: HTTP }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/etcd }
+      volumes:
+        - { name: data, emptyDir: {} }
+
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dummy-gpu-code
+data:
+  gpu_dummy.py: |
+    #!/usr/bin/env python3
+    import argparse, os, signal, time, math, socket, random
+    import torch
+    import torch.distributed as dist
+
+    # ------- graceful shutdown (SIGTERM/SIGINT) -------
+    _RUNNING = True
+    def _handle_sigterm(signum, frame):
+        global _RUNNING
+        _RUNNING = False
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
+
+    def env_int(name, default=None):
+        v = os.getenv(name)
+        return int(v) if v is not None else default
+
+    def init_dist(backend="nccl"):
+        """Initialize torch.distributed if env is present. Non-fatal on failure."""
+        try:
+            if dist.is_available() and not dist.is_initialized():
+                # Common envs provided by torchrun / Kubeflow
+                # MASTER_ADDR/MASTER_PORT/WORLD_SIZE/RANK/LOCAL_RANK
+                dist.init_process_group(backend=backend, init_method="env://")
+                return True
+        except Exception as e:
+            print(f"[WARN] dist init failed: {e}", flush=True)
+        return False
+
+    @torch.no_grad()
+    def burn_gpu(local_rank: int,
+                target_util: float = 0.9,
+                allreduce_every: int = 50,
+                allow_comm: bool = True):
+        """
+        Infinite loop of heavy GEMMs + occasional all-reduce.
+        * target_util: try to keep compute saturated (no sleeps by default)
+        * If comm fails or peer dies, we continue compute-only.
+        """
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
+        # Reserve big tensors to push SM and HBM. Pick size based on available VRAM.
+        total = torch.cuda.get_device_properties(device).total_memory
+        # Use ~60% of memory for buffers (safe margin to avoid OOM).
+        budget = int(total * 0.60)
+
+        # Choose square matrix size n for FP16 so that 3*n*n*2 bytes ~= budget
+        # (A,B,accumulator-ish). Clamp to multiples of 1024 for better kernels.
+        bytes_per_el = 2  # fp16
+        n = int(math.sqrt(budget / (3 * bytes_per_el)))
+        n = max(8192, (n // 1024) * 1024)  # floor to 1024, min 8192
+        # cap extremely large n to avoid allocator fragmentation
+        n = min(n, 16384)
+
+        print(f"[RANK {os.getenv('RANK','?')} / L{local_rank}] using matmul size: {n}x{n}", flush=True)
+
+        # Allocate big operands; use fp16 with fp32 accumulation via matmul
+        a = torch.randn((n, n), device=device, dtype=torch.float16)
+        b = torch.randn((n, n), device=device, dtype=torch.float16)
+        c = torch.empty((n, n), device=device, dtype=torch.float16)
+
+        # Optional extra working sets to keep HBM busier
+        extra = [torch.randn((n, n), device=device, dtype=torch.float16) for _ in range(2)]
+
+        # Warmup
+        for _ in range(5):
+            c = a @ b
+            for x in extra:
+                c = c + x
+            torch.cuda.synchronize()
+
+        step = 0
+        world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+        rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+
+        # Enable async error handling so collectives return instead of deadlock
+        os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+
+        # Main infinite loop until killed
+        while _RUNNING:
+            # Compute-heavy section (no sleeps -> keep util high)
+            c = a @ b
+            # A few fused-ish ops to add ALU & memory traffic
+            for x in extra:
+                c = torch.add(c, x)
+            c = torch.nn.functional.gelu(c.to(torch.float32)).to(torch.float16)
+            # small random reassign to fight kernel caching monotony
+            if step % 10 == 0:
+                a, b = b, a
+
+            # Occasional comms between nodes (non-blocking best-effort)
+            if allow_comm and world > 1 and (step % allreduce_every == 0):
+                try:
+                    # Use a tiny tensor for the collective to keep focus on compute
+                    t = torch.tensor([random.random()], device=device, dtype=torch.float32)
+                    work = dist.all_reduce(t, op=dist.ReduceOp.SUM, async_op=True)
+                    # short wait with timeout-ish pattern
+                    while not work.is_completed():
+                        # if we're being killed, bail out
+                        if not _RUNNING:
+                            break
+                        # tiny spin; don't sleep to keep GPU hot
+                    # use result a bit
+                    _ = (t.item())
+                except Exception as e:
+                    # If peer down or comm issue, log once per while and keep going
+                    if step % (allreduce_every * 10) == 0:
+                        print(f"[RANK {rank}] comm failed (continuing compute-only): {e}", flush=True)
+
+            step += 1
+
+        # Cleanup
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        print(f"[RANK {rank} / L{local_rank}] exiting...", flush=True)
+
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--allreduce-every", type=int, default=50,
+                            help="How many compute steps between all-reduce attempts")
+        parser.add_argument("--no-comm", action="store_true", help="Disable cross-node communication")
+        args = parser.parse_args()
+
+        local_rank = env_int("LOCAL_RANK", 0)
+        # Initialize distributed; if it fails, keep going compute-only
+        dist_ok = init_dist("nccl")
+
+        burn_gpu(local_rank=local_rank,
+                target_util=0.9,
+                allreduce_every=args.allreduce_every,
+                allow_comm=(not args.no_comm) and dist_ok)
+
+    if __name__ == "__main__":
+        torch.backends.cudnn.benchmark = True
+        main()
+
+---
+
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: ku-junyoung-dummy-job-test
+spec:
+  elasticPolicy:
+    rdzvId: ku-junyoung-dummy-job-test
+    rdzvBackend: etcd-v2
+    rdzvHost: ku-junyoung-dummy-job-test-etcd
+    rdzvPort: 2379
+    minReplicas: 2
+    maxReplicas: 4
+    nProcPerNode: 8
+
+  runPolicy:
+    cleanPodPolicy: None        # 죽은 파드 남겨둠 (자동 정리 X)
+    ttlSecondsAfterFinished: 0  # 종료 후 즉시 GC하지 않음
+    # retryLimit을 0으로: 실패 시 재시작/재시도 안 함
+    # (Training Operator v1에서는 replica단위 restartPolicy=Never와 함께 동작)
+    # 일부 버전에서는 backoffLimit가 Job에만 적용되므로 아래는 생략 가능
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 4
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          nodeSelector:
+            mlx.navercorp.com/zone: h100-i001v8
+          containers:
+            - name: pytorch
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK"]
+              image: nvcr.io/nvidia/pytorch:24.02-py3
+              imagePullPolicy: IfNotPresent
+              resources:
+                limits:
+                  cpu: "16"
+                  memory: "256Gi"
+                  nvidia.com/gpu: 8
+                  rdma/hca_shared_devices_a: 1
+                requests:
+                  cpu: "16"
+                  memory: "256Gi"
+                  nvidia.com/gpu: 8
+                  rdma/hca_shared_devices_a: 1
+              env:
+                - name: NCCL_IB_DISABLE
+                  value: "0"
+                - name: OMP_NUM_THREADS
+                  value: "4"
+                - name: PYTHONUNBUFFERED
+                  value: '1'
+                - name: MALLOC_TRIM_THRESHOLD_
+                  value: '0'
+                - name: NCCL_NET_GDR_LEVEL
+                  value: '2'
+                - name: NCCL_IB_HCA
+                  value: mlx5_2,mlx5_3,mlx5_4,mlx5_5
+                - name: NCCL_IB_GID_INDEX
+                  value: '0'
+                - name: NCCL_NVLS_ENABLE
+                  value: '1'
+                - name: NCCL_CROSS_NIC
+                  value: '0'
+                - name: NCCL_SOCKET_IFNAME
+                  value: eth0
+                - name: GLOO_SOCKET_IFNAME
+                  value: eth0
+                - name: NCCL_SOCKET_FAMILY
+                  value: AF_INET
+                - name: GLOO_SOCKET_FAMILY
+                  value: AF_INET
+                - name: TP_USE_IPV6
+                  value: '0'
+                - name: GLOO_USE_LIBUV
+                  value: '0'
+                - name: NCCL_DEBUG
+                  value: INFO
+                - name: NCCL_DEBUG_SUBSYS
+                  value: INIT,NET
+                - name: TORCH_NCCL_BLOCKING_WAIT
+                  value: '1'
+                - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+                  value: '1'
+                - name: TORCH_DISTRIBUTED_DETAIL
+                  value: INFO
+                - name: TORCH_DISTRIBUTED_DEBUG
+                  value: INFO
+                - name: GLOO_USE_IPV6
+                  value: '0'
+                - name: NCCL_USE_IPV6
+                  value: '0'
+                - name: NCCL_IB_DISABLE
+                  value: '0'
+                - name: NCCL_IB_TIMEOUT
+                  value: '22'
+                - name: NCCL_IB_RETRY_CNT
+                  value: '7'
+                - name: PET_RDZV_ENDPOINT
+                  value: "ku-junyoung-dummy-job-test-etcd:2379"
+              ports:
+                - { name: rdzv, containerPort: 2379 }   # etcd
+                - { name: c10d, containerPort: 29400 }  # 🔒 고정 c10d store 포트 (중요)
+              volumeMounts:
+              - name: dummy-code
+                mountPath: /workspace/code
+                readOnly: true
+              - name: shared-memory
+                mountPath: /dev/shm
+              workingDir: /workspace/code
+              command: ["/bin/bash","-lc"]
+              args:
+              - |
+                set -Euxo pipefail
+
+                python3 -m pip install --no-cache-dir --upgrade pip
+                python3 -m pip install --no-cache-dir --target /opt/pydeps python-etcd==0.4.5
+                export PYTHONPATH="/opt/pydeps${PYTHONPATH:+:$PYTHONPATH}"
+
+                # AF_INET 강제(안전 장치)
+                export GLOO_SOCKET_FAMILY=AF_INET
+                export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-eth0}
+                export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
+                export TP_USE_IPV6=0 GLOO_USE_IPV6=0 NCCL_USE_IPV6=0
+
+                MASTER_PORT="${MASTER_PORT:-29400}"
+
+                exec torchrun \
+                  --nnodes ${PET_NNODES} \
+                  --nproc-per-node ${PET_NPROC_PER_NODE} \
+                  --rdzv-id ${PET_RDZV_ID} \
+                  --rdzv-backend ${PET_RDZV_BACKEND} \
+                  --rdzv-endpoint "${PET_RDZV_ENDPOINT}" \
+                  --master-port "${MASTER_PORT}" \
+                  /workspace/code/gpu_dummy.py \
+                  --allreduce-every=50
+          volumes:
+          - name: dummy-code
+            configMap:
+              name: dummy-gpu-code
+              items:
+                - key: gpu_dummy.py
+                  path: gpu_dummy.py
+          - name: shared-memory
+            emptyDir:
+              medium: Memory
+
